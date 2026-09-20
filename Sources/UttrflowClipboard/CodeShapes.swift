@@ -26,7 +26,7 @@ enum CodeShapes {
         func has(_ pattern: Regex<Substring>, needing literals: [StaticString]) -> Bool {
             ClipBytes.containsAny(text, literals) && text.firstMatch(of: pattern) != nil
         }
-        // Read once so a closing brace cannot score here and as a statement ending too.
+        // Both braces, read once so a closing brace cannot also score as a statement ending.
         let braces = text.contains("{") && text.contains("}")
         let signals: [() -> Bool] = [
             { braces },
@@ -35,6 +35,7 @@ enum CodeShapes {
             { has(invocation, needing: ["("]) },
             { has(commentLine, needing: ["//", "/*", "*", "#", "--"]) },
             { text.firstMatch(of: query) != nil },
+            { has(quotedMember, needing: ["\""]) },
             { has(shellFragment, needing: ["|", "&&", "$(", ">", "-"]) },
             {
                 has(
@@ -106,6 +107,9 @@ enum CodeShapes {
     /// A line that opens with a comment marker in one of the usual spellings.
     nonisolated(unsafe) static let commentLine = #/^\h*(?://|/\*|\*\s|\#\s|--\s)/#
         .anchorsMatchLineEndings()
+
+    /// A quoted key against a colon, which is what a one-line JSON object has instead of the punctuation the other signals look for.
+    nonisolated(unsafe) static let quotedMember = #/"[^"\n]*"\s*:/#
 
     /// SQL, which has none of the punctuation the other signals look for.
     nonisolated(unsafe) static let query =

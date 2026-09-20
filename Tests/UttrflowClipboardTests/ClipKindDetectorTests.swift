@@ -165,6 +165,8 @@ struct ClipKindDetectorTests {
             "func greet(name: String) -> String {\n    \"Hello, \\(name)\"\n}",
             "if (ready) { start(); }",
             "func greet() {}",
+            #"{"name": "uttrflow", "retries": 3}"#,
+            #"[{"id": 1}, {"id": 2}]"#,
             "const total = items.length;",
             "class Invoice(models.Model):\n    number = models.CharField()",
             "import Foundation\nimport Testing",

@@ -225,6 +225,7 @@ enum WholeClipDetector {
             text.firstMatch(of: CodeShapes.invocation) != nil,
             text.firstMatch(of: CodeShapes.commentLine) != nil,
             text.firstMatch(of: CodeShapes.query) != nil,
+            text.firstMatch(of: CodeShapes.quotedMember) != nil,
             text.firstMatch(of: CodeShapes.shellFragment) != nil,
         ]
         return signals.count(where: { $0 }) >= 2
