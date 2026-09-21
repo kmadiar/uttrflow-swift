@@ -53,6 +53,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Keeps the pipeline's stage timings for the session, which is what the diagnostics page reports on.
     private let diagnostics = DiagnosticsRecorder()
+    /// Whether secure keyboard entry is hiding the shortcut, checked on app switches and menu opens rather than on a timer.
+    private let secureInput = SecureInputWatch()
+    private var secureInputObserver: (any NSObjectProtocol)?
 
     /// Whether the recogniser can dictate, which is not whether its files are on disk.
     private var speechReadiness: SpeechModelReadiness = .notInstalled
@@ -210,9 +213,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var scopes: [MainTab: String] = [:]
 
     /// How long a finished result stays up, so the last dictation does not sit over every app.
-    private static let successLingers = Duration.seconds(2)
+    static let successLingers = Duration.seconds(2)
     /// Longer, because a failure asks something of the user — but it still goes.
-    private static let failureLingers = Duration.seconds(10)
+    static let failureLingers = Duration.seconds(10)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         settings = settingsStore.load()
@@ -675,6 +678,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard let pipeline else { return }
 
         menuBar.onCommand = { [weak self] intent in self?.carryOut(intent) }
+        menuBar.onMenuWillOpen = { [weak self] in self?.checkSecureInput() }
+        secureInputObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkSecureInput() }
+        }
 
         // Submitted, not handled: the controller queues gestures so press and release cannot interleave.
         dock.onPressBegan = { [weak self] in self?.controller?.submit(.pressed) }
@@ -683,6 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         dock.setShortcut(SettingsShortcut.compact(settings.hotkey))
         dock.setShrinksToGrip(settings.shrinksToGripWhenIdle)
+        checkSecureInput()
         if settings.floatingButtonIsShown {
             dock.setAnchor(settings.floatingButtonAnchor)
             dock.show()
@@ -864,8 +874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             closeQuickPanel()
             return
         }
-        // A copy made since the last poll is taken now, so the panel never opens without it — started,
-        // not waited for, since a read another app answers would hold the panel shut (#895).
+        // A copy since the last poll is taken now, started not awaited, so no read holds the panel shut (#895).
         if settings.clipboardEnabled {
             let arrived: @Sendable (NoticedClip) async -> Void = { [weak self] noticed in
                 await self?.clipArrived(noticed)
@@ -1384,6 +1393,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
+    /// Redraws the menu bar and the floating button's hint when secure keyboard entry turns on or off.
+    private func checkSecureInput() {
+        guard secureInput.check() else { return }
+        let now = secureInput.isBlocking ? "on" : "off"
+        Self.log.notice("secure keyboard entry \(now, privacy: .public)")
+        dock.setShortcutUnheard(shortcutUnheard)
+        refreshMenuBar()
+    }
+
+    /// Why the shortcut cannot be heard, for both surfaces that say so.
+    private var shortcutUnheard: String? {
+        secureInput.isBlocking ? SecureInputWatch.notice : nil
+    }
+
     /// Translates the pipeline's state into the menu's vocabulary, deciding nothing.
     private func menuBarState(for state: DictationState) -> MenuBarState {
         let activity: DictationActivity =
@@ -1409,7 +1432,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             canCheckForUpdates: UpdateController.isConfigured,
             updateProgress: updates.progress,
             features: MenuBarFeatures(settings),
-            shortcuts: settings.shortcuts
+            shortcuts: settings.shortcuts,
+            shortcutUnheard: shortcutUnheard
         )
     }
 
@@ -1972,17 +1996,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
     }
 
+    /// How long a finished state stays up, or `nil` for a state that is not finished.
+    static func linger(after state: DictationState) -> Duration? {
+        switch state {
+        // Copied rather than typed asks the user to paste, so it stays as long as a failure.
+        case .inserted(let outcome) where outcome.method == .clipboard: failureLingers
+        case .inserted: successLingers
+        // An informational notice asks nothing of the user, so it goes sooner.
+        case .failed(let notice):
+            notice.severity == .informational ? successLingers : failureLingers
+        case .idle, .recording, .transcribing, .tidying, .inserting: nil
+        }
+    }
+
     /// Returns the interface to rest once the user has had time to read the result.
     private func scheduleDismissal(after state: DictationState) {
         dismissalTask?.cancel()
-        let linger: Duration
-        switch state {
-        case .inserted: linger = Self.successLingers
-        // An informational notice asks nothing of the user, so it goes sooner.
-        case .failed(let notice):
-            linger = notice.severity == .informational ? Self.successLingers : Self.failureLingers
-        case .idle, .recording, .transcribing, .tidying, .inserting: return
-        }
+        guard let linger = Self.linger(after: state) else { return }
 
         dismissalTask = Task { [weak self] in
             try? await Task.sleep(for: linger)

@@ -1,3 +1,4 @@
+package import Synchronization
 import UttrflowCore
 public import UttrflowPredict
 
@@ -69,30 +70,56 @@ public actor PredictStore: PredictionStore {
 
     /// The lines this person recently entered in this field, each once, the ones from this document first.
     public func recent(in surface: Surface, limit: Int) throws(PredictStoreError) -> [String] {
-        guard limit > 0 else { return [] }
+        let ids = try surfaceIdentifiers(of: surface)
+        guard !ids.isEmpty, limit > 0 else { return [] }
         let here = try identifier(of: surface, creating: false) ?? -1
-        return try database.rows(
-            Self.recentQuery,
-            { statement in
-                statement.bind(1, surface.bundleIdentifier)
-                statement.bind(2, surface.role)
-                statement.bind(3, surface.locator ?? "")
-                statement.bind(4, here)
-                statement.bind(5, Int64(limit))
+        // One indexed read per scope, ordered and de-duplicated here, so SQLite groups nothing. See #880.
+        var newest: [String: (used: Double, isHere: Bool)] = [:]
+        var order: [String] = []
+        for id in ids {
+            for line in try recentLines(surfaceIdentifier: id, limit: limit) {
+                let isHere = id == here
+                guard let seen = newest[line.text] else {
+                    newest[line.text] = (line.used, isHere)
+                    order.append(line.text)
+                    continue
+                }
+                newest[line.text] = (max(seen.used, line.used), seen.isHere || isHere)
             }
-        ) { $0.text(0) }
+        }
+        // The document in hand first, then the newest; arrival order breaks a tie, as the grouped read did.
+        let ranked = order.enumerated().sorted { left, right in
+            let one = newest[left.element] ?? (0, false)
+            let other = newest[right.element] ?? (0, false)
+            if one.isHere != other.isHere { return one.isHere }
+            if one.used != other.used { return one.used > other.used }
+            return left.offset < right.offset
+        }
+        return ranked.prefix(limit).map(\.element)
+    }
+
+    /// The per-scope recency read, exposed so a test can check its plan groups and sorts nothing.
+    static let recentQuery = """
+        SELECT text, last_used FROM entry
+        WHERE surface_id = ? AND superseded_by IS NULL AND count > self_sourced
+        ORDER BY last_used DESC LIMIT ?
+        """
+
+    /// One scope's most recent lines, read straight off `entry_recent` rather than grouped.
+    private func recentLines(
+        surfaceIdentifier id: Int64, limit: Int
+    ) throws(PredictStoreError) -> [(text: String, used: Double)] {
+        try database.rows(
+            Self.recentQuery,
+            {
+                $0.bind(1, id)
+                $0.bind(2, Int64(limit))
+            }
+        ) { ($0.text(0), $0.double(1)) }
     }
 
     /// How many compiled statements the open file keeps.
     var cachedStatements: Int { database.cachedStatements }
-
-    /// The recency read `entry_recent` serves, one SQL text however many documents the field has been in.
-    static let recentQuery = """
-        SELECT text, MAX(last_used) AS used, MAX(surface_id = ?4) AS here FROM entry
-        WHERE surface_id IN (SELECT id FROM surface WHERE bundle_id = ?1 AND role = ?2 AND locator = ?3)
-        AND superseded_by IS NULL AND count > self_sourced
-        GROUP BY text ORDER BY here DESC, used DESC LIMIT ?5
-        """
 
     /// Every surface that is the same field in the same application, whatever document it was in.
     private func surfaceIdentifiers(of surface: Surface) throws(PredictStoreError) -> [Int64] {
@@ -209,27 +236,38 @@ public actor PredictStore: PredictionStore {
         let width = FuzzyMatch.maskWidth(forQueryOfLength: needle.count, within: budget)
         let queryMask = FuzzyMatch.mask(needle)
 
-        let all = try readCandidates(
+        // Filtered in SQL and then by mask, so only a line that matches is ever built into a `Candidate`.
+        let shortest = max(0, needle.count - budget)
+        let rows = try database.rows(
             """
             SELECT \(entryColumns) FROM entry
             WHERE surface_id = ? AND superseded_by IS NULL
-            """, { $0.bind(1, id) }, distance: 0)
-
-        var matched: [Candidate] = []
-        for candidate in all {
-            let units = FuzzyMatch.units(candidate.text)
+                AND length(CAST(text AS BLOB)) >= ?
+            """,
+            {
+                $0.bind(1, id)
+                $0.bind(2, Int64(shortest))
+            }
+        ) { row -> Candidate? in
+            Self.rowsScanned.withLock { $0 += 1 }
+            let text = row.text(0)
+            let units = FuzzyMatch.units(text)
             guard
                 FuzzyMatch.couldMatch(
                     query: queryMask, candidate: FuzzyMatch.mask(units.prefix(width)), within: budget)
-            else { continue }
+            else { return nil }
             let distance = FuzzyMatch.prefixDistance(needle, units, within: budget)
-            guard distance <= budget else { continue }
-            matched.append(
-                Candidate(
-                    text: candidate.text, source: candidate.source, evidence: candidate.evidence,
-                    editDistance: distance, isIrreversible: candidate.isIrreversible))
+            guard distance <= budget else { return nil }
+            return Candidate(
+                text: text, source: .personal,
+                evidence: Entry(
+                    text: text, count: row.integer(1), accepted: row.integer(2),
+                    rejected: row.integer(3), selfSourced: row.integer(4),
+                    lastUsed: Date(timeIntervalSince1970: row.double(5))),
+                editDistance: distance,
+                isIrreversible: DestructiveCommand.matches(text))
         }
-        return Self.strongest(matched)
+        return Self.strongest(rows.compactMap { $0 })
     }
 
     // MARK: - Writing
@@ -261,7 +299,8 @@ public actor PredictStore: PredictionStore {
             ON CONFLICT (surface_id, text) DO UPDATE SET
               count = count + 1,
               self_sourced = self_sourced + excluded.self_sourced,
-              last_used = excluded.last_used
+              last_used = excluded.last_used,
+              text_lower = excluded.text_lower
             """,
             {
                 $0.bind(1, id)
@@ -445,6 +484,8 @@ public actor PredictStore: PredictionStore {
             })
     }
 
+    /// How many rows the fuzzy tier has looked at, which a test reads to bound the per-keystroke work.
+    package static let rowsScanned = Mutex(0)
     /// Keeps a surface's successions within the same cap as its entries, dropping the least followed and then the oldest.
     private func evictWeakestSuccessions(surfaceIdentifier id: Int64) throws(PredictStoreError) {
         let held = try database.rows(
